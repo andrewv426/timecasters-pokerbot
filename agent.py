@@ -25,22 +25,27 @@ need to change it, and if you break it the judge can't talk to your bot.
 import os
 import traceback
 
+import numpy as np
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from evaluator import card_rank, card_suit, cards_to_str, omaha_score, warmup  # handy helpers, see evaluator.py
-from game import Action, AgentConfig, HandResult, Observation, Street
+from bot_equity import rank_tables
+from bot_policy import choose_legal_action, load_preflop
+from game import Action, AgentConfig, HandResult, Observation
+from opponent_model import OpponentModel
 
 # Build omaha_score's lookup table now, while the server starts, instead of
 # during your first decision (where it would eat into your time bank).
 # Do any other slow setup (loading a model, ...) here too: the server must
 # answer within 15 seconds of starting.
-warmup()
+rank_tables()
+PREFLOP = load_preflop()
 
 # rename as your team/bot's name
-PARTICIPANT = "TotallyAwesomeDatathonParticipant"
-AGENT_NAME = "JustAsAwesomeAgent"
+PARTICIPANT = "Timecasters"
+ADAPTATION = os.environ.get("POKER_ADAPTATION", "1") == "1"
+AGENT_NAME = "Adaptive Equity" if ADAPTATION else "Fixed Equity"
 
 
 # ===== YOUR CODE HERE =====
@@ -55,7 +60,17 @@ def new_half(config: AgentConfig, memory: dict) -> None:
     In the tournament, each half runs in a brand-new copy of your server,
     so nothing you learn in one half carries over to the other half.
     """
-    memory["hands_played"] = 0
+    memory.update(
+        config=config,
+        rng=np.random.default_rng(20261107),
+        hands_played=0,
+        equity_key=None,
+        equity=None,
+        strategy_seconds=0.0,
+        strategy_fallbacks=0,
+    )
+    if ADAPTATION:
+        memory["opponent_model"] = OpponentModel(config)
 
 
 def choose_action(obs: Observation, memory: dict) -> Action:
@@ -86,11 +101,7 @@ def choose_action(obs: Observation, memory: dict) -> Action:
     scores your hand (higher is better).
     """
 
-    # Simple example of a heuristic bot, which just checks when it is of no cost, otherwise folds
-    # Replace this with your strategy!
-    if obs.to_call == 0:
-        return Action.CHECK_CALL
-    return Action.FOLD
+    return choose_legal_action(obs, memory, PREFLOP)
 
 
 def on_hand_end(result: HandResult, memory: dict) -> None:
@@ -105,6 +116,9 @@ def on_hand_end(result: HandResult, memory: dict) -> None:
     only after a showdown, else None), winner ('me', 'opp' or 'split').
     """
     memory["hands_played"] += 1
+    model = memory.get("opponent_model")
+    if model is not None:
+        model.finish(result)
 
 # ===== END OF YOUR CODE =====
 
