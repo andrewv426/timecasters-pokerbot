@@ -82,3 +82,50 @@ def test_rates_use_a_minimum_sample_and_discount_old_evidence():
     new_rate, _ = model.estimate(key, 555, 0.55)
     assert new_rate < 0.30
     assert model.estimate(("bet", 2, 1), 555, 0.36) == pytest.approx((0.36, 0.0))
+
+
+@pytest.mark.parametrize("button", [0, 1])
+@pytest.mark.parametrize("action, lane", [(Action.RAISE_HALF, 0), (Action.RAISE_POT, 1)])
+def test_first_flop_bet_learns_terminal_fold_by_position_and_price(button, action, lane):
+    game = Game(make_deal("flop-fold", 0), button_seat=button)
+    model = OpponentModel(AgentConfig(), learn_flop_pressure=True)
+    while game.street < Street.FLOP:
+        play(game, model, Action.CHECK_CALL)
+    if game.to_act != 0:
+        play(game, model, Action.CHECK_CALL)
+    play(game, model, action)
+    play(game, model, Action.FOLD)
+    model.finish(game.hand_result(0))
+    assert model.rates["flop_fold", int(button == 0), lane].at(0) == (1, 1)
+
+
+@pytest.mark.parametrize("action, size", [(Action.RAISE_HALF, 0), (Action.RAISE_POT, 1)])
+@pytest.mark.parametrize("revealed", [False, True])
+def test_turn_size_is_learned_from_reveal_once(action, size, revealed):
+    game = Game(make_deal("turn-sizing", 0), button_seat=1)
+    model = OpponentModel(AgentConfig(), learn_turn_sizing=True)
+    while game.street < Street.TURN:
+        play(game, model, Action.CHECK_CALL)
+    play(game, model, Action.CHECK_CALL)
+    play(game, model, action)
+    while not game.is_terminal:
+        play(game, model, Action.CHECK_CALL)
+    result = game.hand_result(0)
+    if not revealed:
+        result = replace(result, opp_hole=None)
+    model.finish(result)
+    model.finish(result)
+    assert model.turn_bet_strength[size].opportunities == int(revealed)
+    assert model.turn_bet_strength[1 - size].opportunities == 0
+
+
+def test_turn_size_signal_needs_both_sizes_and_substantial_reversal():
+    model = OpponentModel(AgentConfig(), learn_turn_sizing=True)
+    half, pot = model.turn_bet_strength
+    for hand in range(20):
+        half.add(0.82, hand)
+    assert model.turn_size_signal(20) == 0
+    for hand in range(20):
+        pot.add(0.40, hand)
+    assert model.turn_size_signal(20) > 0.60
+    assert model.turn_size_signal(3_000) == 0

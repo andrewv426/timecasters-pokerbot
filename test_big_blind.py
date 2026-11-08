@@ -5,7 +5,7 @@ import pytest
 
 from big_blind import BigBlindRange, midranks, realized_equity
 from bot_equity import draw_worlds, rank_tables, unseen_cards
-from bot_policy import load_preflop
+from bot_policy import flop_equity, load_preflop
 from game import Action, AgentConfig, Game, Street, make_deal
 from opponent_model import OpponentModel
 
@@ -24,6 +24,12 @@ def test_realization_depends_on_depth_and_preserves_terminal_equity():
     )
     assert realized_equity(0.40, 0, Street.FLOP, 0.15) == 0.40
     assert realized_equity(0.40, 8, Street.RIVER, 0.15) == 0.40
+
+
+def test_flop_realization_distinguishes_position_and_preserves_all_in_equity():
+    assert flop_equity(0.35, 4, 0.3, False) < flop_equity(0.35, 4, 0.3, True) < 0.35
+    assert flop_equity(0.70, 4, 0.3, False) > 0.70
+    assert flop_equity(0.35, 0, 0.3, False) == 0.35
 
 
 def test_opponent_open_still_affects_range_on_the_flop():

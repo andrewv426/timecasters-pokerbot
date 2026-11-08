@@ -32,6 +32,7 @@ class Event:
     raises: int
     can_raise: bool
     button: bool
+    turn_bet_size: int | None = None
 
     @property
     def lane(self) -> int:
@@ -50,15 +51,16 @@ class Frequency:
     hits: float = 0.0
     opportunities: float = 0.0
     hand: int = 0
+    decay: float = _DECAY
 
     def at(self, hand: int) -> tuple[float, float]:
-        decay = _DECAY ** max(0, hand - self.hand)
+        decay = self.decay ** max(0, hand - self.hand)
         return self.hits * decay, self.opportunities * decay
 
-    def add(self, hit: bool, hand: int) -> None:
+    def add(self, hit: float, hand: int) -> None:
         now = max(hand, self.hand)
         hits, opportunities = self.at(now)
-        weight = _DECAY ** (now - hand)
+        weight = self.decay ** (now - hand)
         self.hits = hits + hit * weight
         self.opportunities = opportunities + weight
         self.hand = now
@@ -86,10 +88,14 @@ class HandTrace:
             other = 1 - player
             due = max(0, self.bets[other] - self.bets[player])
             if not record.is_me:
+                turn_bet_size = None
+                if (self.street == Street.TURN and not self.raises and record.action in _RAISES
+                        and record.amount < min(self.stacks)):
+                    turn_bet_size = int(record.amount / self.pot >= 0.70)
                 self.events.append(Event(
                     self.street, record.action, due, self.pot, self.raises,
                     self.raises < cap and self.stacks[1] > due and self.stacks[0] > 0,
-                    not obs.is_button,
+                    not obs.is_button, turn_bet_size,
                 ))
             self.pot += record.amount
             self.bets[player] = record.street_total
@@ -126,12 +132,18 @@ class HandTrace:
 
 
 class OpponentModel:
-    def __init__(self, config: AgentConfig):
+    def __init__(self, config: AgentConfig, learn_turn_sizing: bool = False,
+                 learn_flop_pressure: bool = False):
         self.config = config
         self.trace: HandTrace | None = None
         self.rates: dict[tuple[str, int, int], Frequency] = {}
         self.finished: set[int] = set()
         self.showdown_rng = np.random.default_rng(852781)
+        self.turn_bet_strength = (
+            Frequency(decay=2 ** (-1 / 650)), Frequency(decay=2 ** (-1 / 650))
+        ) if learn_turn_sizing else ()
+        self.turn_showdown_rng = np.random.default_rng(421073)
+        self.learn_flop_pressure = learn_flop_pressure
 
     def observe(self, obs: Observation) -> None:
         key = (obs.hand_index, obs.hole_cards, obs.is_button)
@@ -150,6 +162,18 @@ class OpponentModel:
         if self.trace and self.trace.events and self.trace.events[-1].street == street:
             return self.trace.events[-1]
         return None
+
+    def turn_size_signal(self, hand: int) -> float:
+        """Confidence in half-pot bets showing more strength than pot bets."""
+        if not self.turn_bet_strength:
+            return 0.0
+        (half, n_half), (pot, n_pot) = (r.at(hand) for r in self.turn_bet_strength)
+        support = min(n_half, n_pot)
+        if support < 6:
+            return 0.0
+        gap = half / n_half - pot / n_pot
+        # Reveals are selective. Require both sizes and a sizeable reversal.
+        return min(0.72, max(0.0, 3.6 * (gap - 0.14))) * min(1.0, support / 12)
 
     def _add(self, kind: str, stage: int, lane: int, hit: bool, hand: int) -> None:
         for key in ((kind, stage, lane), (kind, stage, -1)):
@@ -187,6 +211,8 @@ class OpponentModel:
             if event.due and event.raises:
                 folded = event.action == Action.FOLD
                 self._add("fold", stage, event.lane, folded, hand)
+                if self.learn_flop_pressure and event.street == Street.FLOP and event.raises == 1:
+                    self._add("flop_fold", int(not event.button), event.lane, folded, hand)
                 if not folded and event.can_raise:
                     self._add("reraise", stage, event.lane, event.action in _RAISES, hand)
             elif event.can_raise:
@@ -202,6 +228,11 @@ class OpponentModel:
             return
         if len(set(hero + result.board + villain)) != 15:
             return
+        if self.turn_bet_strength:
+            turn = next((e for e in events if e.turn_bet_size is not None), None)
+            if turn is not None:
+                strength = _shown_strength(hero, villain, result.board[:4], self.turn_showdown_rng)
+                self.turn_bet_strength[turn.turn_bet_size].add(strength, result.hand_index)
         event = next((e for e in reversed(events)
                       if e.street != Street.PREFLOP and e.action in _RAISES), None)
         if event is None:
@@ -209,10 +240,16 @@ class OpponentModel:
         # A revealed weak bet is evidence of bluffing on this line. Hidden
         # cards and unobserved opportunities never enter the sample.
         board = result.board[:BOARD_CARDS_VISIBLE[event.street]]
-        triples = combination_index(np.asarray(board)[_TRIPLES[len(board)]])
-        opponents = draw_worlds(unseen_cards(hero, board), 0, 32, self.showdown_rng)
-        score = rank_tables().best(combination_index(np.asarray(villain)[_PAIRS]), triples)
-        reference = rank_tables().best(combination_index(opponents[:, _PAIRS]), triples)
-        percentile = float(((reference < score) + 0.5 * (reference == score)).mean())
+        percentile = _shown_strength(hero, villain, board, self.showdown_rng)
         self._add("weak_bet", phase(event.street), int(event.button), percentile < 0.33,
                   result.hand_index)
+
+
+def _shown_strength(hero: tuple[int, ...], villain: tuple[int, ...], board: tuple[int, ...],
+                    rng: np.random.Generator) -> float:
+    triples = combination_index(np.asarray(board)[_TRIPLES[len(board)]])
+    opponents = draw_worlds(unseen_cards(hero, board), 0, 32, rng)
+    tables = rank_tables()
+    score = tables.best(combination_index(np.asarray(villain)[_PAIRS]), triples)
+    reference = tables.best(combination_index(opponents[:, _PAIRS]), triples)
+    return float(((reference < score) + 0.5 * (reference == score)).mean())
