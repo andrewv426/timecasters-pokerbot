@@ -101,7 +101,7 @@ class RankTables:
             made_equity, redraw, False, len(worlds),
         )
 
-    def river(self, hole: tuple[int, ...], board: tuple[int, ...]) -> Equity:
+    def river_profile(self, hole: tuple[int, ...], board: tuple[int, ...]) -> tuple[np.ndarray, Equity]:
         triples = combination_index(np.array(board)[_BOARD_TRIPLES[5]])
         hero_pairs = combination_index(np.array(hole)[_HOLE_PAIRS])
         hero = self.best(hero_pairs, triples)
@@ -115,8 +115,11 @@ class RankTables:
         percentiles = (frequency.cumsum() - 0.5 * frequency) / len(villain)
         shares = showdown_share(hero, ranks)
         equity = float(shares @ frequency / len(villain))
-        return Equity(shares, percentiles, frequency, equity, 0.0,
-                      bool(hero >= ranks[-1]), len(villain))
+        return ranks, Equity(shares, percentiles, frequency, equity, 0.0,
+                             bool(hero >= ranks[-1]), len(villain))
+
+    def river(self, hole: tuple[int, ...], board: tuple[int, ...]) -> Equity:
+        return self.river_profile(hole, board)[1]
 
 
 _RIVER_AVAILABLE_PAIRS = card_sets(26, 2)

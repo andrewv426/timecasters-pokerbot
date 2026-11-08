@@ -45,7 +45,13 @@ PREFLOP = load_preflop()
 # rename as your team/bot's name
 PARTICIPANT = "Timecasters"
 ADAPTATION = os.environ.get("POKER_ADAPTATION", "1") == "1"
-AGENT_NAME = "Adaptive Equity" if ADAPTATION else "Fixed Equity"
+BIG_BLIND_RANGE = os.environ.get("POKER_BIG_BLIND_RANGE", "1") == "1"
+LATE_DEFENSE = os.environ.get("POKER_LATE_DEFENSE", "1") == "1"
+AGENT_NAME = "Fixed Equity"
+if ADAPTATION:
+    AGENT_NAME = "Adaptive Equity BB" if BIG_BLIND_RANGE else "Adaptive Equity"
+    if LATE_DEFENSE:
+        AGENT_NAME += " Late"
 
 
 # ===== YOUR CODE HERE =====
@@ -68,6 +74,8 @@ def new_half(config: AgentConfig, memory: dict) -> None:
         equity=None,
         strategy_seconds=0.0,
         strategy_fallbacks=0,
+        improve_big_blind=BIG_BLIND_RANGE,
+        guard_late_calls=ADAPTATION and LATE_DEFENSE,
     )
     if ADAPTATION:
         memory["opponent_model"] = OpponentModel(config)

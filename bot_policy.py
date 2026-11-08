@@ -7,8 +7,10 @@ from time import perf_counter
 
 import numpy as np
 
+from big_blind import BigBlindRange, realized_equity
 from bot_equity import Equity, combination_index, draw_worlds, rank_tables, unseen_cards
 from game import Action, AgentConfig, Observation, Street, default_action
+from late_defense import defensive_weights, pressure, river_pressure_cost
 from opponent_model import OpponentModel, phase, size_bucket
 
 _LOG = logging.getLogger(__name__)
@@ -36,7 +38,7 @@ def legal_raises(obs: Observation) -> list[tuple[Action, int]]:
 
 
 def preflop_action(obs: Observation, table: np.ndarray, rng: np.random.Generator,
-                   model: OpponentModel | None = None) -> Action:
+                   model: OpponentModel | None = None, improve_bb: bool = False) -> Action:
     uniform, open_equity, tight, playable = table[combination_index(np.asarray(obs.hole_cards))]
     raises = legal_raises(obs)
     if obs.raises_this_street == 0:
@@ -71,7 +73,11 @@ def preflop_action(obs: Observation, table: np.ndarray, rng: np.random.Generator
             return raises[-1][0]
         if rng.random() < 0.76:
             return raises[0][0]
-    if equity >= price + position_cost:
+    if improve_bb:
+        can_call = realized_equity(float(equity), spr, Street.PREFLOP, float(playable)) >= price
+    else:
+        can_call = equity >= price + position_cost
+    if can_call:
         return Action.CHECK_CALL
     return default_action(obs.to_call)
 
@@ -87,7 +93,8 @@ def continuation_cost(obs: Observation, pot: int, added: int, opponent_added: in
 
 
 def raise_value(obs: Observation, target: int, config: AgentConfig, estimate: Equity,
-                weights: np.ndarray, fold_shift: float = 0.0, reraise_shift: float = 0.0) -> float:
+                weights: np.ndarray, fold_shift: float = 0.0, reraise_shift: float = 0.0,
+                improve_bb: bool = False) -> float:
     paid = target - obs.my_bet
     matched = min(obs.opp_stack, target - obs.opp_bet)
     final_pot = obs.pot + paid + matched
@@ -95,6 +102,11 @@ def raise_value(obs: Observation, target: int, config: AgentConfig, estimate: Eq
     continue_rate = np.clip(
         0.18 + 0.90 * strength - 0.66 * matched / final_pot - fold_shift, 0.07, 0.96
     )
+    if improve_bb:
+        cheap_call = max(0.0, 1 - (matched / final_pot) / 0.20)
+        # Discount projected folds when the big blind would build a pot
+        # out of position, with a larger adjustment for cheap calls.
+        continue_rate += (0.12 + 0.73 * cheap_call) * (1 - continue_rate)
     reraise_rate = 0.0
     reraise_value = 0.0
     if (obs.raises_this_street + 1 < config.raise_cap
@@ -107,15 +119,26 @@ def raise_value(obs: Observation, target: int, config: AgentConfig, estimate: Eq
         reraised_pot = obs.pot + paid + reraise_to - obs.opp_bet + extra
         reraise_weights = weights * continue_rate * reraise_rate
         equity = float(reraise_weights @ estimate.shares / reraise_weights.sum())
-        equity -= continuation_cost(obs, reraised_pot, paid + extra,
-                                    reraise_to - obs.opp_bet, estimate.redraw)
+        if improve_bb:
+            left = min(obs.my_stack - paid - extra, obs.opp_stack - reraise_to + obs.opp_bet)
+            equity = realized_equity(equity, left / reraised_pot, obs.street, estimate.redraw)
+        else:
+            equity -= continuation_cost(obs, reraised_pot, paid + extra,
+                                        reraise_to - obs.opp_bet, estimate.redraw)
         reraise_value = reraise_weights.sum() * max(
             -paid, equity * reraised_pot - paid - extra
         )
     call_weights = weights * continue_rate * (1 - reraise_rate)
     fold_weight = weights @ (1 - continue_rate)
-    cushion = continuation_cost(obs, final_pot, paid, matched, estimate.redraw)
-    call_value = call_weights @ ((estimate.shares - cushion) * final_pot - paid)
+    if improve_bb:
+        call_mass = float(call_weights.sum())
+        called_equity = float(call_weights @ estimate.shares / call_mass)
+        left = min(obs.my_stack - paid, obs.opp_stack - matched)
+        equity = realized_equity(called_equity, left / final_pot, obs.street, estimate.redraw)
+        call_value = call_mass * (equity * final_pot - paid)
+    else:
+        cushion = continuation_cost(obs, final_pot, paid, matched, estimate.redraw)
+        call_value = call_weights @ ((estimate.shares - cushion) * final_pot - paid)
     return float((fold_weight * obs.pot + call_value + reraise_value) / weights.sum())
 
 
@@ -178,13 +201,24 @@ def has_river_blocker(obs: Observation) -> bool:
 
 
 def postflop_action(obs: Observation, config: AgentConfig, estimate: Equity,
-                    mix: float, model: OpponentModel | None = None) -> tuple[Action, float]:
-    weights = betting_weights(obs, estimate, model)
+                    mix: float, model: OpponentModel | None = None,
+                    improve_bb: bool = False, guard_late_calls: bool = False) -> tuple[Action, float]:
+    # The big-blind range already includes the current action.
+    weights = estimate.frequency if improve_bb else betting_weights(obs, estimate, model)
+    severity = pressure(obs, model) if guard_late_calls else 0.0
+    weights = defensive_weights(weights, estimate.opponent_strength, severity)
     equity = float(weights @ estimate.shares / weights.sum())
     call = min(obs.to_call, obs.my_stack)
     pot_if_called = obs.pot + call
-    cushion = continuation_cost(obs, pot_if_called, call, 0, estimate.redraw)
-    passive_value = max(0.0, equity - cushion) * pot_if_called - call
+    if improve_bb:
+        left = min(obs.my_stack - call, obs.opp_stack)
+        available = realized_equity(equity, left / pot_if_called, obs.street, estimate.redraw)
+    else:
+        cushion = continuation_cost(obs, pot_if_called, call, 0, estimate.redraw)
+        available = max(0.0, equity - cushion)
+    passive_value = available * pot_if_called - call - river_pressure_cost(
+        obs, severity, estimate.redraw
+    )
     candidates = [(passive_value, Action.CHECK_CALL)]
     if Action.FOLD in obs.legal_actions:
         candidates.append((0.0, Action.FOLD))
@@ -208,7 +242,8 @@ def postflop_action(obs: Observation, config: AgentConfig, estimate: Equity,
             risk = (0.045 if obs.to_call else 0.025) * (target - obs.my_bet)
             if extra_bluff and not (value_hand or semi_bluff or estimate.nuts):
                 risk += 0.06 * obs.pot
-            value = raise_value(obs, target, config, estimate, weights, fold_shift, reraise_shift)
+            value = raise_value(obs, target, config, estimate, weights, fold_shift, reraise_shift,
+                                improve_bb)
             candidates.append((value - risk, action))
     candidates.sort(key=lambda choice: choice[0], reverse=True)
     margin = candidates[0][0] - candidates[1][0] if len(candidates) > 1 else float("inf")
@@ -219,8 +254,24 @@ def policy_action(obs: Observation, memory: dict, preflop: np.ndarray) -> Action
     config = memory["config"]
     rng = memory["rng"]
     model = memory.get("opponent_model")
+    improve_bb = memory.get("improve_big_blind", False) and not obs.is_button and model is not None
+    guard_late_calls = memory.get("guard_late_calls", False)
     if obs.street == Street.PREFLOP:
-        return preflop_action(obs, preflop, rng, model)
+        return preflop_action(obs, preflop, rng, model, improve_bb)
+
+    if improve_bb and memory["strategy_seconds"] < 0.52 * config.time_bank_seconds:
+        key = (obs.hand_index, obs.hole_cards, obs.board)
+        cache = memory.get("big_blind_range")
+        mix = rng.random()
+        if cache is None or cache[0] != key:
+            remaining = unseen_cards(obs.hole_cards, obs.board)
+            samples = {Street.FLOP: 224, Street.TURN: 288, Street.RIVER: 512}[obs.street]
+            worlds = draw_worlds(remaining, 5 - len(obs.board), samples, rng)
+            cache = key, BigBlindRange.build(obs, preflop, worlds)
+            memory["big_blind_range"] = cache
+        estimate = cache[1].condition(obs, model)
+        return postflop_action(obs, config, estimate, mix, model, improve_bb=True,
+                               guard_late_calls=guard_late_calls)[0]
 
     tables = rank_tables()
     key = (obs.hand_index, obs.hole_cards, obs.board)
@@ -240,14 +291,16 @@ def policy_action(obs: Observation, memory: dict, preflop: np.ndarray) -> Action
             estimate = tables.sample(obs.hole_cards, obs.board, worlds)
         memory["equity"] = estimate
 
-    action, margin = postflop_action(obs, config, estimate, mix, model)
+    action, margin = postflop_action(obs, config, estimate, mix, model,
+                                     guard_late_calls=guard_late_calls)
     if (headroom and obs.street != Street.RIVER and estimate.trials < 384
             and obs.pot >= 12 and margin < 0.032 * obs.pot):
         remaining = unseen_cards(obs.hole_cards, obs.board)
         worlds = draw_worlds(remaining, 5 - len(obs.board), 384, rng)
         estimate = tables.sample(obs.hole_cards, obs.board, worlds)
         memory["equity"] = estimate
-        action, _ = postflop_action(obs, config, estimate, mix, model)
+        action, _ = postflop_action(obs, config, estimate, mix, model,
+                                   guard_late_calls=guard_late_calls)
     return action
 
 
