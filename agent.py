@@ -49,6 +49,8 @@ BIG_BLIND_RANGE = os.environ.get("POKER_BIG_BLIND_RANGE", "1") == "1"
 LATE_DEFENSE = os.environ.get("POKER_LATE_DEFENSE", "1") == "1"
 TURN_SIZING = os.environ.get("POKER_TURN_SIZING", "1") == "1"
 FLOP_PRESSURE = os.environ.get("POKER_FLOP_PRESSURE", "1") == "1"
+SPLIT_BB_READS = os.environ.get("POKER_SPLIT_BB_READS", "0") == "1"
+TURN_LOOKAHEAD = os.environ.get("POKER_TURN_LOOKAHEAD", "0") == "1"
 AGENT_NAME = "Fixed Equity"
 if ADAPTATION:
     AGENT_NAME = "Adaptive Equity BB" if BIG_BLIND_RANGE else "Adaptive Equity"
@@ -78,11 +80,13 @@ def new_half(config: AgentConfig, memory: dict) -> None:
         strategy_fallbacks=0,
         improve_big_blind=BIG_BLIND_RANGE,
         flop_pressure=ADAPTATION and FLOP_PRESSURE,
+        turn_lookahead=TURN_LOOKAHEAD,
         guard_late_calls=ADAPTATION and LATE_DEFENSE,
     )
     if ADAPTATION:
         memory["opponent_model"] = OpponentModel(
-            config, learn_turn_sizing=TURN_SIZING, learn_flop_pressure=FLOP_PRESSURE
+            config, learn_turn_sizing=TURN_SIZING, learn_flop_pressure=FLOP_PRESSURE,
+            split_bb_reads=BIG_BLIND_RANGE and SPLIT_BB_READS,
         )
 
 

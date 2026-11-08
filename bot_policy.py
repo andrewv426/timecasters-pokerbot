@@ -12,6 +12,7 @@ from bot_equity import Equity, combination_index, draw_worlds, rank_tables, unse
 from game import Action, AgentConfig, Observation, Street, default_action
 from late_defense import defensive_weights, pressure, river_pressure_cost
 from opponent_model import OpponentModel, phase, size_bucket
+from turn_lookahead import turn_call_value
 
 _LOG = logging.getLogger(__name__)
 _PREFLOP_PATH = Path(__file__).with_name("data") / "preflop.npz"
@@ -197,11 +198,11 @@ def betting_weights(obs: Observation, estimate: Equity,
 
     key = event.bet_context()
     prior = 0.13 if key[0] == "reraise" else (0.36 if event.button else 0.27)
-    rate, trust = model.estimate(key, obs.hand_index, prior)
+    rate, trust = model.estimate_for(obs, key, prior)
     if not trust:
         return weights
-    weak, weak_trust = model.estimate(
-        ("weak_bet", phase(obs.street), int(event.button)), obs.hand_index, 0.16
+    weak, weak_trust = model.estimate_for(
+        obs, ("weak_bet", phase(obs.street), int(event.button)), 0.16
     )
     # Keep a broad bluff component and add weight only for affirmative weak
     # showdown evidence. Showdown samples favor hands strong enough to continue.
@@ -224,8 +225,8 @@ def response_shifts(obs: Observation, target: int,
     lane = size_bucket(price)
     stage = phase(obs.street)
     fold_prior = 0.54 + 0.06 * lane + 0.015 * (obs.street == Street.RIVER)
-    fold, _ = model.estimate(("fold", stage, lane), obs.hand_index, fold_prior)
-    reraise, _ = model.estimate(("reraise", stage, lane), obs.hand_index, 0.105)
+    fold, _ = model.estimate_for(obs, ("fold", stage, lane), fold_prior)
+    reraise, _ = model.estimate_for(obs, ("reraise", stage, lane), 0.105)
     return min(0.22, max(-0.22, fold - fold_prior)), min(0.12, max(-0.075, reraise - 0.105))
 
 
@@ -239,7 +240,8 @@ def has_river_blocker(obs: Observation) -> bool:
 def postflop_action(obs: Observation, config: AgentConfig, estimate: Equity,
                     mix: float, model: OpponentModel | None = None,
                     improve_bb: bool = False, guard_late_calls: bool = False,
-                    flop_pressure: bool = False) -> tuple[Action, float]:
+                    flop_pressure: bool = False,
+                    turn_hands: np.ndarray | None = None) -> tuple[Action, float]:
     # The big-blind range already includes the current action.
     weights = estimate.frequency if improve_bb else betting_weights(obs, estimate, model)
     severity = pressure(obs, model) if guard_late_calls else 0.0
@@ -306,6 +308,19 @@ def postflop_action(obs: Observation, config: AgentConfig, estimate: Equity,
                                 improve_bb, flop_model)
             candidates.append((value - risk, action))
     candidates.sort(key=lambda choice: choice[0], reverse=True)
+    if (turn_hands is not None and model is not None and obs.street == Street.TURN
+            and not obs.is_button and obs.raises_this_street == 1
+            and call >= 3 * obs.big_blind and call / pot_if_called >= 0.23
+            and min(obs.my_stack - call, obs.opp_stack) >= 2 * obs.big_blind
+            and abs(passive_value) <= 0.07 * pot_if_called
+            and {choice[1] for choice in candidates[:2]} == {Action.CHECK_CALL, Action.FOLD}):
+        projected = turn_call_value(obs, model, turn_hands, weights)
+        # The rollout assumes we check the river. Blend it with the baseline
+        # to allow for river leads and uncertainty about future bet sizes.
+        value = 0.35 * passive_value + 0.65 * projected
+        candidates = [(value if action == Action.CHECK_CALL else ev, action)
+                      for ev, action in candidates]
+        candidates.sort(key=lambda choice: choice[0], reverse=True)
     margin = candidates[0][0] - candidates[1][0] if len(candidates) > 1 else float("inf")
     return candidates[0][1], margin
 
@@ -331,8 +346,13 @@ def policy_action(obs: Observation, memory: dict, preflop: np.ndarray) -> Action
             cache = key, BigBlindRange.build(obs, preflop, worlds)
             memory["big_blind_range"] = cache
         estimate = cache[1].condition(obs, model)
+        turn_hands = None
+        if (memory.get("turn_lookahead", False)
+                and memory["strategy_seconds"] < 0.42 * config.time_bank_seconds):
+            turn_hands = cache[1].turn_hands
         return postflop_action(obs, config, estimate, mix, model, improve_bb=True,
-                               guard_late_calls=guard_late_calls, flop_pressure=flop_pressure)[0]
+                               guard_late_calls=guard_late_calls, flop_pressure=flop_pressure,
+                               turn_hands=turn_hands)[0]
 
     tables = rank_tables()
     key = (obs.hand_index, obs.hole_cards, obs.board)

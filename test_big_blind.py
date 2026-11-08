@@ -67,3 +67,25 @@ def test_river_conditioning_preserves_exact_outcomes_and_total_mass():
     assert posterior.frequency.sum() == pytest.approx(exact.trials)
     assert np.all(posterior.frequency >= 0.17 * exact.frequency)
     assert not np.allclose(posterior.frequency, exact.frequency)
+
+
+def test_big_blind_flop_distinguishes_pot_and_half_pot_bets():
+    deal = make_deal("flop-size", 0)
+    preflop = load_preflop()
+    weighted_strength = []
+    for action in (Action.RAISE_HALF, Action.RAISE_POT):
+        game = Game(deal, button_seat=1)
+        for _ in range(3):
+            game.apply(Action.CHECK_CALL)
+        game.apply(action)
+        obs = game.observation(0)
+        model = OpponentModel(AgentConfig())
+        model.observe(obs)
+        worlds = draw_worlds(unseen_cards(obs.hole_cards, obs.board), 2, 256,
+                            np.random.default_rng(73))
+        sample = BigBlindRange.build(obs, preflop, worlds)
+        weights = sample.condition(obs, model).frequency
+        assert weights.mean() == pytest.approx(1.0)
+        assert np.all(weights > 0)
+        weighted_strength.append(np.average(sample.strengths[Street.FLOP], weights=weights))
+    assert weighted_strength[1] > weighted_strength[0]

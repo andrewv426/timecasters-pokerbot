@@ -1,6 +1,7 @@
 """Half-local opponent estimates from public actions and revealed showdowns."""
 
 from dataclasses import dataclass, field
+from enum import IntEnum
 
 import numpy as np
 
@@ -23,6 +24,12 @@ def size_bucket(price: float) -> int:
     return int(price >= 0.29)
 
 
+class FlopLine(IntEnum):
+    CHECKED_THROUGH = 0
+    HERO_AGGRESSOR = 1
+    OPPONENT_AGGRESSOR = 2
+
+
 @dataclass(frozen=True)
 class Event:
     street: Street
@@ -33,6 +40,8 @@ class Event:
     can_raise: bool
     button: bool
     turn_bet_size: int | None = None
+    flop_line: FlopLine = FlopLine.CHECKED_THROUGH
+    full_size: bool = False
 
     @property
     def lane(self) -> int:
@@ -77,6 +86,7 @@ class HandTrace:
     cursor: int = 0
     events: list[Event] = field(default_factory=list)
     pending: tuple[Observation, Action] | None = None
+    flop_line: FlopLine = FlopLine.CHECKED_THROUGH
 
     def consume(self, obs: Observation, cap: int) -> None:
         for record in obs.action_history[self.cursor:]:
@@ -95,8 +105,15 @@ class HandTrace:
                 self.events.append(Event(
                     self.street, record.action, due, self.pot, self.raises,
                     self.raises < cap and self.stacks[1] > due and self.stacks[0] > 0,
-                    not obs.is_button, turn_bet_size,
+                    not obs.is_button, turn_bet_size, self.flop_line,
+                    # Subtract the call before measuring the raise. The pot
+                    # action can be a much smaller bet when stacks are short.
+                    full_size=(record.action == Action.RAISE_POT
+                               and record.amount - due >= 0.70 * (self.pot + due)),
                 ))
+            if self.street == Street.FLOP and record.action in _RAISES:
+                self.flop_line = (FlopLine.HERO_AGGRESSOR if record.is_me
+                                  else FlopLine.OPPONENT_AGGRESSOR)
             self.pot += record.amount
             self.bets[player] = record.street_total
             self.stacks[player] -= record.amount
@@ -123,7 +140,7 @@ class HandTrace:
             else:
                 return None
             return Event(obs.street, reply, due, after_raise, obs.raises_this_street + 1,
-                         can_raise, not obs.is_button)
+                         can_raise, not obs.is_button, flop_line=self.flop_line)
         if (action == Action.CHECK_CALL and obs.street == Street.RIVER and not obs.is_button
                 and not obs.to_call and result.went_to_showdown and result.pot == obs.pot):
             return Event(obs.street, Action.CHECK_CALL, 0, obs.pot, 0,
@@ -133,7 +150,7 @@ class HandTrace:
 
 class OpponentModel:
     def __init__(self, config: AgentConfig, learn_turn_sizing: bool = False,
-                 learn_flop_pressure: bool = False):
+                 learn_flop_pressure: bool = False, split_bb_reads: bool = False):
         self.config = config
         self.trace: HandTrace | None = None
         self.rates: dict[tuple[str, int, int], Frequency] = {}
@@ -144,6 +161,9 @@ class OpponentModel:
         ) if learn_turn_sizing else ()
         self.turn_showdown_rng = np.random.default_rng(421073)
         self.learn_flop_pressure = learn_flop_pressure
+        self.split_bb_reads = split_bb_reads
+        self.bb_pot_rates: dict[tuple[Street, bool], Frequency] = {}
+        self.bb_rates: dict[tuple[str, Street, int, FlopLine | None], Frequency] = {}
 
     def observe(self, obs: Observation) -> None:
         key = (obs.hand_index, obs.hole_cards, obs.is_button)
@@ -194,6 +214,49 @@ class OpponentModel:
             return prior, 0.0
         return (hits + 18 * prior) / (total + 18), total / (total + 24)
 
+    def bb_estimate(self, key: tuple[str, int, int], street: Street, hand: int, prior: float,
+                    flop_line: FlopLine) -> tuple[float, float]:
+        rate, trust = self.estimate(key, hand, prior)
+        if not self.split_bb_reads or street not in (Street.FLOP, Street.TURN):
+            return rate, trust
+        kind, _, lane = key
+        # Back off from the turn line to the street, then to the pooled read.
+        contexts = (None, flop_line) if street == Street.TURN else (None,)
+        for context in contexts:
+            local = self.bb_rates.get((kind, street, lane, context))
+            if local is not None:
+                hits, total = local.at(hand)
+                if total >= 6:
+                    rate = (hits + 18 * rate) / (total + 18)
+                    trust = max(trust, total / (total + 24))
+        return rate, trust
+
+    def bb_pot_rate(self, event: Event, hand: int) -> float:
+        """Estimate pot-sized aggression per legal opportunity in this context."""
+        reraise = bool(event.raises and event.due)
+        prior = 0.14 if reraise else 0.28
+        rate = self.bb_pot_rates.get((event.street, reraise))
+        if rate is None:
+            return prior
+        hits, total = rate.at(hand)
+        return (hits + 24 * prior) / (total + 24)
+
+    def estimate_for(self, obs: Observation, key: tuple[str, int, int],
+                     prior: float) -> tuple[float, float]:
+        if obs.is_button:
+            return self.estimate(key, obs.hand_index, prior)
+        line = self.trace.flop_line if self.trace else FlopLine.CHECKED_THROUGH
+        return self.bb_estimate(key, obs.street, obs.hand_index, prior, line)
+
+    def _record_rate(self, event: Event, key: tuple[str, int, int], hit: bool, hand: int) -> None:
+        self._add(*key, hit, hand)
+        if self.split_bb_reads and event.button and event.street in (Street.FLOP, Street.TURN):
+            kind, _, lane = key
+            contexts = (None, event.flop_line) if event.street == Street.TURN else (None,)
+            for context in contexts:
+                local = self.bb_rates.setdefault((kind, event.street, lane, context), Frequency())
+                local.add(hit, hand)
+
     def finish(self, result: HandResult) -> None:
         trace = self.trace
         if trace is None or trace.key[0] != result.hand_index or result.hand_index in self.finished:
@@ -208,15 +271,19 @@ class OpponentModel:
         hand = result.hand_index
         for event in events:
             stage = phase(event.street)
+            if event.button and event.can_raise and event.street in (Street.FLOP, Street.TURN):
+                key = (event.street, bool(event.raises and event.due))
+                self.bb_pot_rates.setdefault(key, Frequency()).add(event.full_size, hand)
             if event.due and event.raises:
                 folded = event.action == Action.FOLD
-                self._add("fold", stage, event.lane, folded, hand)
+                self._record_rate(event, ("fold", stage, event.lane), folded, hand)
                 if self.learn_flop_pressure and event.street == Street.FLOP and event.raises == 1:
                     self._add("flop_fold", int(not event.button), event.lane, folded, hand)
                 if not folded and event.can_raise:
-                    self._add("reraise", stage, event.lane, event.action in _RAISES, hand)
+                    self._record_rate(event, ("reraise", stage, event.lane),
+                                      event.action in _RAISES, hand)
             elif event.can_raise:
-                self._add(*event.bet_context(), event.action in _RAISES, hand)
+                self._record_rate(event, event.bet_context(), event.action in _RAISES, hand)
         self._record_showdown(result, obs.hole_cards, events)
         self.finished.add(hand)
         self.trace = None
@@ -241,8 +308,8 @@ class OpponentModel:
         # cards and unobserved opportunities never enter the sample.
         board = result.board[:BOARD_CARDS_VISIBLE[event.street]]
         percentile = _shown_strength(hero, villain, board, self.showdown_rng)
-        self._add("weak_bet", phase(event.street), int(event.button), percentile < 0.33,
-                  result.hand_index)
+        self._record_rate(event, ("weak_bet", phase(event.street), int(event.button)),
+                          percentile < 0.33, result.hand_index)
 
 
 def _shown_strength(hero: tuple[int, ...], villain: tuple[int, ...], board: tuple[int, ...],

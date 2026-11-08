@@ -46,12 +46,14 @@ def _likelihood(event: Event, strengths: np.ndarray, weights: np.ndarray,
     kind, stage, lane = event.bet_context()
     prior = {"open": 0.49, "isolate": 0.28, "reraise": 0.13,
              "bet": 0.36 if event.button else 0.27}[kind]
-    aggressive, _ = model.estimate((kind, stage, lane), hand, prior)
+    aggressive, _ = model.bb_estimate((kind, stage, lane), event.street, hand, prior,
+                                     event.flop_line)
     folded = 0.0
     if kind == "reraise":
         price = event.due / (event.pot + event.due)
         prior_fold = min(0.62, 1.5 * price)
-        folded, _ = model.estimate(("fold", stage, lane), hand, prior_fold)
+        folded, _ = model.bb_estimate(("fold", stage, lane), event.street, hand, prior_fold,
+                                      event.flop_line)
         aggressive *= 1 - folded
     if not event.can_raise:
         aggressive = 0.0
@@ -60,6 +62,11 @@ def _likelihood(event: Event, strengths: np.ndarray, weights: np.ndarray,
     pct = midranks(strengths, weights)
     width = (0.38, 0.48, 0.32)[stage]
     bluff_share = (0.08, 0.19, 0.17)[stage]
+    if event.full_size and event.street in (Street.FLOP, Street.TURN):
+        pot_rate = model.bb_pot_rate(event, hand)
+        value_tail = _soft_tail(pct, 0.90 * pot_rate, 0.26 if kind == "reraise" else 0.36)
+        # Use the frequency of this size, with a floor for bluffs and draws.
+        return 0.90 * value_tail + 0.10 * pot_rate
     if aggressive >= 0.72:
         # A very frequent bet carries little information about this hand.
         return np.ones_like(weights)
@@ -86,6 +93,7 @@ class BigBlindRange:
     estimate: Equity
     strengths: dict[Street, np.ndarray]
     river_bins: tuple[np.ndarray, np.ndarray] | None = None
+    turn_hands: np.ndarray | None = None
 
     @classmethod
     def build(cls, obs: Observation, preflop: np.ndarray, worlds: np.ndarray):
@@ -101,7 +109,8 @@ class BigBlindRange:
             triples = combination_index(board[_TRIPLES[len(board)]])
             strengths[street] = tables.best(sample_pairs, triples)
         if obs.street != Street.RIVER:
-            return cls(tables.sample(obs.hole_cards, obs.board, worlds), strengths)
+            return cls(tables.sample(obs.hole_cards, obs.board, worlds), strengths,
+                       turn_hands=hands if obs.street == Street.TURN else None)
         ranks, exact = tables.river_profile(obs.hole_cards, obs.board)
         bins = (exact.opponent_strength * _RIVER_BINS).astype(int)
         sampled_bins = bins[ranks.searchsorted(strengths[Street.RIVER])]
@@ -120,8 +129,11 @@ class BigBlindRange:
                 continue
             weights *= _likelihood(event, self.strengths[event.street], weights, model, obs.hand_index)
             weights /= weights.mean()
-        # Bound concentration even after long, highly correlated action sequences.
-        posterior = 0.83 * weights + 0.17
+        # Keep some uniform mass, but let a current full-sized bet carry more
+        # weight than the generic aggression model.
+        full_size = events and events[-1].street == obs.street and events[-1].full_size
+        floor = 0.07 if full_size else 0.17
+        posterior = (1 - floor) * weights + floor
         return replace(self.estimate, frequency=posterior)
 
     def _condition_river(self, obs, model, events, weights) -> Equity:

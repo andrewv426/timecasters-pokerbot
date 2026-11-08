@@ -34,9 +34,9 @@ def pressure(obs: Observation, model: OpponentModel | None) -> float:
         return strength
     key = event.bet_context()
     prior = 0.13 if key[0] == "reraise" else (0.36 if event.button else 0.27)
-    rate, trust = model.estimate(key, obs.hand_index, prior)
-    weak, weak_trust = model.estimate(
-        ("weak_bet", phase(obs.street), int(event.button)), obs.hand_index, 0.16
+    rate, trust = model.estimate_for(obs, key, prior)
+    weak, weak_trust = model.estimate_for(
+        obs, ("weak_bet", phase(obs.street), int(event.button)), 0.16
     )
     # Frequent betting and confirmed weak showdowns both temper the adjustment.
     aggression_discount = min(0.35, 1.15 * trust * max(0.0, rate - prior))

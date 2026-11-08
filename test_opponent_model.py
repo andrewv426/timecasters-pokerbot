@@ -5,7 +5,7 @@ from dataclasses import replace
 import pytest
 
 from game import Action, AgentConfig, Game, Street, make_deal
-from opponent_model import OpponentModel
+from opponent_model import Event, FlopLine, OpponentModel
 
 
 def play(game, model, action):
@@ -99,6 +99,49 @@ def test_first_flop_bet_learns_terminal_fold_by_position_and_price(button, actio
     assert model.rates["flop_fold", int(button == 0), lane].at(0) == (1, 1)
 
 
+@pytest.mark.parametrize("line", list(FlopLine))
+def test_big_blind_turn_read_tracks_last_flop_aggressor(line):
+    game = Game(make_deal("split-turn", 0), button_seat=1)
+    model = OpponentModel(AgentConfig(), split_bb_reads=True)
+    while game.street < Street.FLOP:
+        play(game, model, Action.CHECK_CALL)
+    if line == FlopLine.HERO_AGGRESSOR:
+        play(game, model, Action.RAISE_HALF)
+        play(game, model, Action.CHECK_CALL)
+    else:
+        play(game, model, Action.CHECK_CALL)
+        if line == FlopLine.OPPONENT_AGGRESSOR:
+            play(game, model, Action.RAISE_HALF)
+        play(game, model, Action.CHECK_CALL)
+    assert game.street == Street.TURN
+    play(game, model, Action.CHECK_CALL)
+    play(game, model, Action.RAISE_HALF)
+    while not game.is_terminal:
+        play(game, model, Action.CHECK_CALL)
+    model.finish(game.hand_result(0))
+    assert model.bb_rates["bet", Street.TURN, 1, line].at(0) == (1, 1)
+    assert model.bb_rates["bet", Street.TURN, 1, None].at(0) == (1, 1)
+    assert ("bet", Street.FLOP, 1, line) not in model.bb_rates
+
+
+def test_big_blind_read_backs_off_and_ignores_button_hands():
+    model = OpponentModel(AgentConfig(), split_bb_reads=True)
+    key = ("bet", 1, 1)
+    flop = Event(Street.FLOP, Action.CHECK_CALL, 0, 4, 0, True, True)
+    turn = replace(flop, street=Street.TURN, flop_line=FlopLine.HERO_AGGRESSOR)
+    model._record_rate(turn, key, True, 0)
+    assert model.bb_estimate(key, Street.TURN, 0, 0.36, turn.flop_line) == (0.36, 0.0)
+    for hand in range(1, 50):
+        model._record_rate(flop, key, False, hand)
+        model._record_rate(turn, key, True, hand)
+        model._record_rate(replace(turn, button=False), key, False, hand)
+    broad, _ = model.estimate(key, 50, 0.36)
+    assert model.bb_estimate(key, Street.FLOP, 50, 0.36, flop.flop_line)[0] < broad
+    assert model.bb_estimate(key, Street.TURN, 50, 0.36, turn.flop_line)[0] > broad
+    hits, opportunities = model.bb_rates["bet", Street.TURN, 1, None].at(50)
+    assert hits == opportunities
+
+
 @pytest.mark.parametrize("action, size", [(Action.RAISE_HALF, 0), (Action.RAISE_POT, 1)])
 @pytest.mark.parametrize("revealed", [False, True])
 def test_turn_size_is_learned_from_reveal_once(action, size, revealed):
@@ -129,3 +172,38 @@ def test_turn_size_signal_needs_both_sizes_and_substantial_reversal():
         pot.add(0.40, hand)
     assert model.turn_size_signal(20) > 0.60
     assert model.turn_size_signal(3_000) == 0
+
+
+@pytest.mark.parametrize("facing_raise", [False, True])
+def test_big_blind_pot_frequency_counts_bets_and_reraises_separately(facing_raise):
+    game = Game(make_deal("pot-frequency", 0), button_seat=1)
+    model = OpponentModel(AgentConfig())
+    while game.street < Street.FLOP:
+        play(game, model, Action.CHECK_CALL)
+    play(game, model, Action.RAISE_HALF if facing_raise else Action.CHECK_CALL)
+    play(game, model, Action.RAISE_POT)
+    obs = game.observation(0)
+    model.observe(obs)
+    event = model.last_event(Street.FLOP)
+    assert event.full_size
+    prior = model.bb_pot_rate(event, obs.hand_index)
+    play(game, model, Action.FOLD)
+    result = game.hand_result(0)
+    model.finish(result)
+    model.finish(result)
+    assert model.bb_pot_rate(event, obs.hand_index) == pytest.approx((1 + 24 * prior) / 25)
+    other = replace(event, raises=0, due=0) if facing_raise else replace(event, raises=1, due=2)
+    assert model.bb_pot_rate(other, obs.hand_index) == (0.28 if facing_raise else 0.14)
+
+
+def test_stack_capped_pot_action_does_not_count_as_full_sized():
+    game = Game(make_deal("short-all-in", 0), button_seat=1)
+    model = OpponentModel(AgentConfig())
+    for action in (Action.RAISE_POT,) * 3 + (Action.CHECK_CALL,) * 2:
+        play(game, model, action)
+    assert game.street == Street.FLOP
+    play(game, model, Action.RAISE_POT)
+    obs = game.observation(0)
+    model.observe(obs)
+    assert obs.opp_stack == 0
+    assert not model.last_event(Street.FLOP).full_size
